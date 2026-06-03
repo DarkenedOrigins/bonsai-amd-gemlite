@@ -1,0 +1,24 @@
+# Python deps for the 1-bit GemLite Bonsai stack on AMD ROCm 7.2.
+# Installed normally (`pip install -r requirements.txt`). gemlite + hqq are installed
+# separately via requirements-nodeps.txt (they need --no-deps; see Containerfile).
+
+# torch from AMD's STABLE ROCm 7.2 channel. The wheel is self-contained (bundles the
+# ROCm runtime) and pulls pytorch-triton-rocm. The exact +rocm7.2 local version is only
+# on this index, so the pin forces it (no generic/CPU torch from PyPI).
+# DO NOT use the nightly/rocm7.2 wheel -- it deadlocks `import torch` (see BUG_REPORT.md).
+--extra-index-url https://download.pytorch.org/whl/rocm7.2
+torch==2.12.0+rocm7.2
+
+# model loading + generation
+transformers>=4.46
+accelerate
+huggingface_hub
+
+# runtime deps of gemlite/hqq (installed here since those go in with --no-deps)
+numpy
+tqdm
+einops
+termcolor
+
+# CLI
+typer

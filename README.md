@@ -32,7 +32,7 @@ and especially HIP/CUDA graphs (eliminate launch overhead).
 
 Short answer: **no meaningful headroom from autotuning** — gemlite's default is already optimal here.
 
-- **Where the GPU time goes** (CUDA-event breakdown, `amd_optimized.py --breakdown`): 1-bit
+- **Where the GPU time goes** (CUDA-event breakdown, `amd_optimized.py breakdown`): 1-bit
   GEMV **58.7%**, attention (sdpa) **1.9%**, everything else (norms/RoPE/dequant/elementwise)
   **39.4%**. So the GEMV kernel is the bottleneck — autotuning it is the right lever to test.
 - **gemlite `GEMV_REVSPLITK` autotune config counts (AMD):** `default`=1, `fast`=16, `max`=540
@@ -41,7 +41,7 @@ Short answer: **no meaningful headroom from autotuning** — gemlite's default i
   each new config slowly) and never completed — exhaustive tuning is effectively intractable here.
 - **Targeted probe:** Bonsai has only **4 unique decode shapes**; `fast` picks
   `N=64,K=64,warps=1,stages=1,waves=2` for all. A principled ~36-config "small" probe
-  (`--autotune small`, centered on that winner, extending into `max`-only territory incl. `K=128`)
+  (`amd_optimized.py tune --scope small`, centered on that winner, extending into `max`-only territory incl. `K=128`)
   found per-shape-different winners — but **`K=128` never won**, and a 6-run A/B vs `fast`
   came out **statistically identical** (medians 184.3 vs 181.8 tok/s; ±10% noise ≫ the 2.5 tok/s gap).
 - **Conclusion:** config tuning is a **dead lever** on RDNA4 for this workload. The gap to the
@@ -51,7 +51,7 @@ Short answer: **no meaningful headroom from autotuning** — gemlite's default i
 **Profiling note:** `torch.profiler` doesn't populate GPU kernel times on this ROCm stack
 (kineto/roctracer gap), and `rocprofv3` can't coexist with pip-torch's bundled ROCm
 (ABI clash → `SIGABRT`). The working approach was **`torch.cuda.Event` module timing**
-(`--breakdown`) — zero-install, runs inside torch's process.
+(`amd_optimized.py breakdown`) — zero-install, runs inside torch's process.
 
 ## Stack
 
@@ -68,10 +68,12 @@ Short answer: **no meaningful headroom from autotuning** — gemlite's default i
 
 | File | Purpose |
 |------|---------|
-| `Containerfile` | Slim Ubuntu 24.04 + stable pip torch (rocm7.2) + gemlite/hqq + C toolchain |
+| `Containerfile` | Slim Ubuntu 24.04 + venv + C toolchain; installs Python deps from `requirements*.txt` |
+| `requirements.txt` | torch (stable ROCm 7.2 channel) + transformers/accelerate/numpy/typer/… |
+| `requirements-nodeps.txt` | gemlite + hqq (installed `--no-deps`, see note 3 below) |
 | `run_minimal.py` | Stage-1 run: 1-bit GemLite generation, plain path (no compile / no graphs) |
 | `bench.py` | Parameterized benchmark: `--acc bf16\|fp16 --mode plain\|compile\|cudagraph --new N` |
-| `amd_optimized.py` | RDNA4 tuning toolkit: `--breakdown` (GPU-time split), `--profile`, `--tune-only`, `--autotune fast\|small\|gemv\|max`, resumable logging to `tmp/` |
+| `amd_optimized.py` | RDNA4 tuning toolkit (typer): `tune --scope {fast,small,gemv,max}` · `bench --load-config` · `breakdown`. Tees logs + configs to `tmp/` |
 | `BUG_REPORT.md` | Write-up of the nightly-wheel import deadlock (for filing upstream) |
 
 Bazzite is immutable, so ROCm/PyTorch live in a container, not on the base OS. The pip
@@ -95,6 +97,11 @@ python run_minimal.py
 
 # 4. Full fast path benchmark
 python bench.py --acc fp16 --mode cudagraph --new 1024
+
+# 5. RDNA4 tuning toolkit (typer) — profile / autotune / benchmark
+python amd_optimized.py breakdown                 # GPU-time split
+python amd_optimized.py tune --scope small        # autotune + cache config to tmp/
+python amd_optimized.py bench --load-config tmp/gemlite_gfx1201.json
 ```
 
 ## Gotchas discovered (the hard-won bits)

@@ -1,0 +1,5 @@
+# gemlite + hqq from the dropbox org. Installed with `pip install --no-deps` so pip does
+# NOT pull a generic PyPI `triton` (gemlite declares `triton>=3.6.0`), which would collide
+# with torch's bundled `triton-rocm`. Their real runtime deps are in requirements.txt.
+git+https://github.com/dropbox/hqq
+git+https://github.com/dropbox/gemlite

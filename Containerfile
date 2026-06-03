@@ -29,27 +29,15 @@ RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel
 
-# torch (+ pytorch-triton-rocm) from the STABLE ROCm 7.2 release channel.
-# NOTE: do NOT use the nightly/rocm7.2 wheel -- 2.13.0.dev hard-links libtorch_rocshmem,
-# whose global constructor calls exit() on a single consumer GPU and deadlocks `import torch`
-# (see BUG_REPORT.md). Stable 2.12.0 doesn't hard-link it and imports fine; arch list
-# includes gfx1201 and it detects the RX 9070 XT.
-RUN pip install --no-cache-dir torch==2.12.0 \
-        --index-url https://download.pytorch.org/whl/rocm7.2
+# All Python package specs live in the repo's requirements files (not hardcoded here):
+#  - requirements.txt        : torch (stable ROCm 7.2 channel; the nightly deadlocks import
+#                              -- see BUG_REPORT.md) + PyPI deps + typer
+#  - requirements-nodeps.txt : gemlite + hqq, installed --no-deps so pip doesn't pull a
+#                              generic `triton` that collides with torch's bundled triton-rocm
+COPY requirements.txt requirements-nodeps.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-deps -r requirements-nodeps.txt
 
-# Demo deps from PyPI. gemlite + hqq from the Dropbox org (project moved there).
-# CRITICAL: gemlite's setup declares `triton>=3.6.0`, which makes pip pull the generic
-# PyPI `triton` on top of torch's `triton-rocm` (both ship a top-level `triton/` module,
-# so they collide and the generic one shadows the ROCm build -> gemlite breaks at runtime).
-# So we install gemlite/hqq with --no-deps and provide their non-triton deps ourselves.
-RUN pip install --no-cache-dir \
-        "transformers>=4.46" accelerate huggingface_hub \
-        numpy tqdm einops termcolor
-RUN pip install --no-cache-dir --no-deps \
-        "git+https://github.com/dropbox/hqq" \
-        "git+https://github.com/dropbox/gemlite"
-
-# NOTE: no build-time `import torch` check. This ROCm nightly's libtorch_hip touches
-# /dev/kfd on import, which doesn't exist in the build sandbox -> the build hangs.
-# ALL torch/GPU validation (import, torch.cuda.get_arch_list(), gfx1201, generation)
+# NOTE: no build-time `import torch` check -- the build sandbox has no /dev/kfd, so torch's
+# HIP init can block. ALL torch/GPU validation (import, get_arch_list, gfx1201, generation)
 # is done at RUNTIME inside the distrobox, where /dev/kfd is present. See run_minimal.py.
