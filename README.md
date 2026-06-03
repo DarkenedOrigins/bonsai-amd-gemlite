@@ -21,8 +21,37 @@ this repo answers — **can that win be reached on consumer RDNA4?** — is **ye
 
 fp16 accumulation barely helps the plain path — batch-1 decode is overhead-bound, not
 compute-bound. The big wins are `torch.compile` (fuses ops, cuts Python/launch overhead)
-and especially HIP/CUDA graphs (eliminate launch overhead). ~166 tok/s is roughly 25% of
-the 5090's ~660 — reasonable for consumer RDNA4 vs flagship Blackwell.
+and especially HIP/CUDA graphs (eliminate launch overhead).
+
+> **Note on the number:** 166.2 was a single early sample. A 6-run A/B later showed the
+> true figure is **~180 tok/s ± 10%** (run-to-run spread ~20 tok/s). That's roughly 27% of
+> the 5090's ~660 — reasonable for consumer RDNA4 vs flagship Blackwell. The NVIDIA 660
+> used `max` autotune + fp16 acc; ours uses gemlite's default (`fast`) autotune (see below).
+
+## Can we beat it? (RDNA4 tuning investigation)
+
+Short answer: **no meaningful headroom from autotuning** — gemlite's default is already optimal here.
+
+- **Where the GPU time goes** (CUDA-event breakdown, `amd_optimized.py --breakdown`): 1-bit
+  GEMV **58.7%**, attention (sdpa) **1.9%**, everything else (norms/RoPE/dequant/elementwise)
+  **39.4%**. So the GEMV kernel is the bottleneck — autotuning it is the right lever to test.
+- **gemlite `GEMV_REVSPLITK` autotune config counts (AMD):** `default`=1, `fast`=16, `max`=540
+  (`3 warps × 2 stages × 3 waves_per_eu × 6 N × 5 K`). The stock path already uses **`fast`**;
+  NVIDIA's 660 used **`max`**. A full `max` run is ~9–10 h on this stack (AMD Triton compiles
+  each new config slowly) and never completed — exhaustive tuning is effectively intractable here.
+- **Targeted probe:** Bonsai has only **4 unique decode shapes**; `fast` picks
+  `N=64,K=64,warps=1,stages=1,waves=2` for all. A principled ~36-config "small" probe
+  (`--autotune small`, centered on that winner, extending into `max`-only territory incl. `K=128`)
+  found per-shape-different winners — but **`K=128` never won**, and a 6-run A/B vs `fast`
+  came out **statistically identical** (medians 184.3 vs 181.8 tok/s; ±10% noise ≫ the 2.5 tok/s gap).
+- **Conclusion:** config tuning is a **dead lever** on RDNA4 for this workload. The gap to the
+  ~2000 tok/s bandwidth roofline is **kernel codegen efficiency + the 39% non-GEMV overhead**,
+  neither of which autotuning can fix. `HipKittens` doesn't help (CDNA-only, GEMM/attention-oriented).
+
+**Profiling note:** `torch.profiler` doesn't populate GPU kernel times on this ROCm stack
+(kineto/roctracer gap), and `rocprofv3` can't coexist with pip-torch's bundled ROCm
+(ABI clash → `SIGABRT`). The working approach was **`torch.cuda.Event` module timing**
+(`--breakdown`) — zero-install, runs inside torch's process.
 
 ## Stack
 
@@ -42,6 +71,7 @@ the 5090's ~660 — reasonable for consumer RDNA4 vs flagship Blackwell.
 | `Containerfile` | Slim Ubuntu 24.04 + stable pip torch (rocm7.2) + gemlite/hqq + C toolchain |
 | `run_minimal.py` | Stage-1 run: 1-bit GemLite generation, plain path (no compile / no graphs) |
 | `bench.py` | Parameterized benchmark: `--acc bf16\|fp16 --mode plain\|compile\|cudagraph --new N` |
+| `amd_optimized.py` | RDNA4 tuning toolkit: `--breakdown` (GPU-time split), `--profile`, `--tune-only`, `--autotune fast\|small\|gemv\|max`, resumable logging to `tmp/` |
 | `BUG_REPORT.md` | Write-up of the nightly-wheel import deadlock (for filing upstream) |
 
 Bazzite is immutable, so ROCm/PyTorch live in a container, not on the base OS. The pip

@@ -13,21 +13,27 @@ HIP graphs) against the stock baseline of 166.2 tok/s.
   # reuse a cached config (fast warmup):
   python amd_optimized.py --load-config gemlite_gfx1201.json
 """
-import os, sys, time, logging, argparse, torch
+import os, sys, time, argparse, traceback, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# --- proper logging: milestones go to a durable, tail-able logfile in repo tmp/ + console ---
+# --- logging: tee BOTH stdout and stderr into a tail-able logfile in repo tmp/, so we capture
+#     our milestones AND gemlite/Triton autotune output (TRITON_PRINT_AUTOTUNING) + progress bars. ---
 _REPO = os.path.dirname(os.path.abspath(__file__))
 _LOGDIR = os.path.join(_REPO, "tmp")
 os.makedirs(_LOGDIR, exist_ok=True)
 LOGPATH = os.path.join(_LOGDIR, f"amd_optimized_{time.strftime('%Y%m%d_%H%M%S')}.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[logging.FileHandler(LOGPATH), logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("amd_optimized")
+_logf = open(LOGPATH, "a", buffering=1)  # line-buffered -> live tail-able
+
+class _Tee:
+    def __init__(self, real, f): self._real, self._f = real, f
+    def write(self, data):
+        self._real.write(data); self._f.write(data); return len(data)
+    def flush(self):
+        self._real.flush(); self._f.flush()
+    def isatty(self): return False            # tqdm/Triton then emit clean line-based output
+    def fileno(self): return self._real.fileno()
+sys.stdout = _Tee(sys.__stdout__, _logf)
+sys.stderr = _Tee(sys.__stderr__, _logf)
 
 # stable 'latest' symlink so you can always `tail -f tmp/amd_optimized_latest.log`
 _LATEST = os.path.join(_LOGDIR, "amd_optimized_latest.log")
@@ -38,22 +44,21 @@ try:
 except OSError:
     pass
 
-# capture uncaught exceptions (autotune/compile failures) in the logfile, not just console
 def _log_excepthook(exc_type, exc, tb):
-    logger.error("UNCAUGHT EXCEPTION", exc_info=(exc_type, exc, tb))
-    sys.__excepthook__(exc_type, exc, tb)
+    traceback.print_exception(exc_type, exc, tb)   # -> stderr -> teed into the logfile
 sys.excepthook = _log_excepthook
 
-def log(m): logger.info(m)
+def log(m): print(f"{time.strftime('%H:%M:%S')} {m}", flush=True)
 
-log(f"logging to {LOGPATH}")
+log(f"logging to {LOGPATH} (captures gemlite/Triton autotune output too)")
 
 BASELINE_TOKS = 166.2  # stock NVIDIA-tuned configs, fp16/cudagraph, on this RX 9070 XT
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--new", type=int, default=1024)
-ap.add_argument("--autotune", choices=["off", "max"], default="max",
-                help="'max' = exhaustive re-autotune from scratch for this GPU (slow warmup)")
+ap.add_argument("--autotune", choices=["off", "fast", "small", "gemv", "max"], default="gemv",
+                help="'fast'=16-config baseline; 'small'=~36-config probe around the fast winner "
+                     "(N/K/warps/waves, incl. max-only K=128); 'gemv'=540-config; 'max'=all kernels; 'off'=stock")
 ap.add_argument("--save-config", default=None, help="cache autotuned configs to JSON")
 ap.add_argument("--load-config", default=None, help="load cached configs (skips autotune)")
 ap.add_argument("--profile", action="store_true",
@@ -63,6 +68,9 @@ ap.add_argument("--decode-only", action="store_true",
                 help="bare eager decode w/ stock configs (no torch.profiler) -- trace it with rocprofv3")
 ap.add_argument("--breakdown", action="store_true",
                 help="CUDA-event GPU-time split: gemlite GEMV vs attention vs other (zero-install profiler)")
+ap.add_argument("--tune-only", action="store_true",
+                help="autotune gemlite on a plain EAGER decode (no torch.compile/cudagraph), cache, exit. "
+                     "Avoids the inductor x gemlite autotune explosion. Then benchmark with --load-config.")
 args = ap.parse_args()
 if args.profile or args.decode_only or args.breakdown:
     args.autotune = "off"  # use stock configs (the 166 tok/s kernels); fast warmup
@@ -83,17 +91,56 @@ import gemlite
 from gemlite.core import DType
 from gemlite.helper import patch_model, A16W1_HQQ_INT
 
-# --- config selection: load cached, or set up exhaustive re-autotune ---
-if args.load_config:
+# --- config selection: load cached configs, then (optionally) keep autotuning uncached ones ---
+if args.load_config and os.path.exists(args.load_config):
     gemlite.load_config(args.load_config)
-    log(f"loaded gemlite config <- {args.load_config} (autotune skipped)")
-elif args.autotune == "max":
-    gemlite.reset_config()  # discard the NVIDIA-tuned presets; tune from scratch here
+    log(f"loaded gemlite config <- {args.load_config}")
+
+if args.autotune in ("fast", "small", "gemv", "max"):
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"  # print each kernel's best config as it tunes
+    if not (args.load_config and os.path.exists(args.load_config)):
+        gemlite.reset_config()  # tune from scratch (discard NVIDIA presets)
+    # 'small' reuses the fast machinery (reload + cudagraph), then OVERRIDES the revsplitk
+    # autotuner's config list with our ~36-config probe centered on the fast winner.
+    spec = {"fast":  {"GEMV_REVSPLITK": "fast"},
+            "small": {"GEMV_REVSPLITK": "fast"},
+            "gemv":  {"GEMV_REVSPLITK": "max"},
+            "max":   "max"}[args.autotune]
     try:
-        gemlite.set_autotune("max", use_cuda_graph=True)
+        gemlite.set_autotune(spec, use_cuda_graph=True)
     except TypeError:
-        gemlite.set_autotune("max")
-    log("gemlite re-autotune = MAX (exhaustive, from scratch) -- warmup will be slow")
+        gemlite.set_autotune(spec)
+
+    if args.autotune == "small":
+        import triton
+        from gemlite.triton_kernels import gemv_revsplitK_kernels as _rk
+        small_cfgs = [
+            triton.Config(
+                {"BLOCK_SIZE_M": 1, "BLOCK_SIZE_N": N, "BLOCK_SIZE_K": K,
+                 "A_load_order": 0, "dot_prod_mode": 0, "waves_per_eu": v},
+                num_warps=w, num_stages=1)
+            for N in (32, 64, 128) for K in (64, 128) for w in (1, 2) for v in (0, 2, 4)
+        ]
+        kobj = _rk.gemv_INT_revsplitK_kernel
+        n_old = len(getattr(kobj, "configs", []))
+        kobj.configs = small_cfgs
+        log(f"SMALL grid override on gemv_INT_revsplitK_kernel: {n_old} -> {len(small_cfgs)} configs "
+            f"(N{{32,64,128}} x K{{64,128}} x warps{{1,2}} x waves{{0,2,4}}, stages=1)")
+    log(f"gemlite re-autotune = {args.autotune} (use_cuda_graph=True)")
+
+    # RESUMABLE: cache whatever's been tuned so far on normal exit OR on kill (SIGTERM/SIGINT),
+    # so a long autotune is never lost -- rerun with --load-config to continue uncached shapes.
+    import signal, atexit
+    def _save_cfg(*_):
+        if args.save_config:
+            try:
+                gemlite.cache_config(args.save_config)
+                log(f"[save] cached gemlite config -> {args.save_config}")
+            except Exception as e:
+                log(f"[save] cache failed: {e}")
+    atexit.register(_save_cfg)
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, lambda *_a: sys.exit(0))  # -> triggers atexit -> _save_cfg
 
 gemlite.set_acc_dtype(DType.FP16)
 
@@ -101,6 +148,23 @@ log("patch_model (1-bit)...")
 t0 = time.time()
 patch_model(model, device=device, processor=A16W1_HQQ_INT(), group_size=128)
 log(f"patched in {time.time()-t0:.1f}s")
+
+# --- TUNE-ONLY: drive gemlite autotune via a plain EAGER decode, then cache & exit. --------
+# Eager (no torch.compile/cudagraph) means each gemlite kernel autotunes ONCE per shape on
+# first call -- no inductor graph replays re-triggering it. With TRITON_PRINT_AUTOTUNING=1
+# you see each kernel's chosen config land in the log as it finishes.
+if args.tune_only:
+    inputs = tok(prompt, return_tensors="pt").to(device)
+    log("tune-only: eager decode driving gemlite GEMV autotune (watch tmp/ log for per-kernel configs)...")
+    t0 = time.time()
+    with torch.no_grad():
+        model.generate(**inputs, max_new_tokens=4, do_sample=False)
+    torch.cuda.synchronize()
+    log(f"autotune eager decode done in {time.time()-t0:.1f}s")
+    if args.save_config:
+        gemlite.cache_config(args.save_config)
+        log(f"cached gemlite config -> {args.save_config}")
+    sys.exit(0)
 
 # --- PROFILE MODE: find where GPU time actually goes, then exit ------------------
 # Profiles an eager decode (stock gemlite configs). Per-kernel GPU (self-device) time
