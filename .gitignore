@@ -1,1 +1,4 @@
 .claude*
+tmp/
+__pycache__/
+*.pyc
